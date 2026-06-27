@@ -8,7 +8,7 @@ from app.config.settings import settings
 from app.database.mongo import connect_to_mongo, close_mongo_connection
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
-from app.routes import auth, students, teachers, courses, attendance, datasets, ml, analytics, dashboard, feedback, reports, system, alerts_router
+from app.routes import auth, students, teachers, courses, attendance, datasets, ml, analytics, dashboard, feedback, reports, system, alerts_router, hdfs_router
 from app.websocket.alerts import router as websocket_router
 
 
@@ -50,6 +50,7 @@ app.include_router(analytics, prefix='/api/analytics', tags=['Analytics'])
 app.include_router(reports, prefix='/api/reports', tags=['Reports'])
 app.include_router(feedback, prefix='/api/feedback', tags=['Feedback'])
 app.include_router(alerts_router, prefix='/api/alerts', tags=['Alerts'])
+app.include_router(hdfs_router, prefix='/api/hdfs', tags=['HDFS'])
 app.include_router(system, prefix='/api/system', tags=['System'])
 app.include_router(websocket_router)
 

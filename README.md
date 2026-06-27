@@ -36,7 +36,57 @@ Education institutions face declining retention, inefficient resource allocation
 - MongoDB, Redis (Docker or local)
 - Hadoop HDFS (optional — degrades gracefully if unavailable)
 
-## Quick Start
+## Hadoop HDFS (Docker) — Required
+
+EduPredict stores **all datasets on HDFS**. MongoDB holds metadata only.
+
+### Start Hadoop cluster
+
+```bash
+cd backend
+docker compose up -d namenode datanode
+# Wait ~60s for NameNode health, then init runs automatically on full stack
+docker compose up hdfs-init
+```
+
+**NameNode Web UI:** http://localhost:9870
+
+### Verify HDFS
+
+```bash
+docker exec edupredict-namenode hdfs dfs -ls /edupredict
+```
+
+You should see: `students.csv`, `attendance.csv`, `academic_records.csv`, `courses.csv`
+
+**NameNode Web UI:** http://localhost:9870/dfshealth.html
+
+### How Hadoop is used (100%)
+
+| Step | What happens |
+|------|----------------|
+| **Upload** | Dataset cleansed → stored on HDFS `/edupredict` → batch processed by HadoopProcessor |
+| **Seeder** | Exports all MongoDB collections to CSV on HDFS |
+| **Analytics** | Live metrics from NameNode JMX + HDFS file browser |
+| **Delete** | Removes file from HDFS and MongoDB metadata |
+| **API** | `GET /api/hdfs/files`, `GET /api/hdfs/cluster`, `POST /api/hdfs/process/{id}` |
+
+Upload **requires** Hadoop running — uploads fail with a clear error if HDFS is down.
+
+```bash
+.venv\Scripts\activate
+python -m app.utils.seeder
+```
+
+This exports students, attendance, courses, and academic records to `/edupredict` on HDFS.
+
+### Full stack (MongoDB + Redis + Hadoop + Backend)
+
+```bash
+docker compose up -d
+```
+
+## Quick Start (local dev)
 
 ### 1. Start MongoDB & Redis
 

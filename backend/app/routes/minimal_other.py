@@ -8,13 +8,14 @@ import pandas as pd
 import psutil
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
-from hdfs import InsecureClient
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from app.auth.dependencies import require_roles
 from app.config.settings import settings
 from app.database.mongo import get_db
+from app.hadoop.hdfs_service import hdfs_service, HDFSError
+from app.hadoop.processor import hadoop_processor
 from app.models.user import UserRole
 from app.ml.models import MLService
 from app.services.crud_service import CRUDService
@@ -32,6 +33,7 @@ reports = APIRouter()
 feedback = APIRouter()
 system = APIRouter()
 alerts_router = APIRouter()
+hdfs_router = APIRouter()
 
 teacher_service = CRUDService("teachers")
 course_service = CRUDService("courses")
@@ -160,14 +162,13 @@ async def upload_dataset(file: UploadFile = File(...), _=Depends(require_roles(U
     before = len(frame)
     frame = frame.drop_duplicates().ffill().fillna(0)
     cleaned = frame.to_csv(index=False).encode("utf-8")
-    hdfs_path = f"{settings.hdfs_base_path}/{file.filename}"
 
-    hdfs_status = "stored"
     try:
-        client = InsecureClient(f"http://{settings.hdfs_host}:{settings.hdfs_port}", user=settings.hdfs_user)
-        client.write(hdfs_path, data=BytesIO(cleaned), overwrite=True)
-    except Exception:
-        hdfs_status = "unavailable"
+        hdfs_path = hdfs_service.upload_file(file.filename, cleaned)
+        hdfs_status = "stored"
+        batch_stats = hadoop_processor.process_hdfs_file(hdfs_path)
+    except HDFSError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     sample_rows = frame.head(10).astype(str).to_dict(orient="records")
     metadata = {
@@ -181,6 +182,8 @@ async def upload_dataset(file: UploadFile = File(...), _=Depends(require_roles(U
         "source": "academic" if "gpa" in frame.columns or "grade" in frame.columns else "attendance" if "attendance" in frame.columns else "lms",
         "hdfs_path": hdfs_path,
         "hdfs_status": hdfs_status,
+        "hadoop_processed": True,
+        "batch_stats": batch_stats,
         "created_at": datetime.utcnow(),
     }
     result = await get_db().datasets.insert_one(metadata)
@@ -215,8 +218,7 @@ async def delete_dataset(dataset_id: str, _=Depends(require_roles(UserRole.admin
         raise HTTPException(status_code=404, detail="Dataset not found")
     if row.get("hdfs_path") and row.get("hdfs_status") == "stored":
         try:
-            client = InsecureClient(f"http://{settings.hdfs_host}:{settings.hdfs_port}", user=settings.hdfs_user)
-            client.delete(row["hdfs_path"], recursive=False)
+            hdfs_service.delete_file(row["hdfs_path"])
         except Exception:
             pass
     await get_db().datasets.delete_one({"_id": ObjectId(dataset_id)})
@@ -425,9 +427,7 @@ async def predictions_overview(_=Depends(require_roles(UserRole.admin, UserRole.
 @analytics.get("/hadoop-overview")
 async def hadoop_overview(_=Depends(require_roles(UserRole.admin, UserRole.teacher, UserRole.analyst))):
     db = get_db()
-    disk = psutil.disk_usage("/")
-    cpu = psutil.cpu_percent(interval=0.1)
-    ram = psutil.virtual_memory().percent
+    cluster = hdfs_service.get_cluster_metrics()
 
     total_rows = 0
     monthly: dict[str, int] = defaultdict(int)
@@ -437,32 +437,33 @@ async def hadoop_overview(_=Depends(require_roles(UserRole.admin, UserRole.teach
         month = str(dataset.get("created_at", datetime.utcnow()))[:7]
         monthly[month] += rows
 
-    hdfs_status = "unavailable"
-    file_count = 0
-    try:
-        client = InsecureClient(f"http://{settings.hdfs_host}:{settings.hdfs_port}", user=settings.hdfs_user)
-        files = client.list(settings.hdfs_base_path)
-        hdfs_status = "connected"
-        file_count = len(files)
-    except Exception:
-        pass
-
     storage_growth = [{"month": month, "tb": round(rows / 1000, 2)} for month, rows in sorted(monthly.items())[-6:]]
     if not storage_growth:
         storage_growth = [{"month": datetime.utcnow().strftime("%Y-%m"), "tb": round(total_rows / 1000, 2)}]
 
+    hdfs_usage = cluster.get("usage_percent", 0) if cluster.get("connected") else 0
+    live_nodes = cluster.get("live_datanodes", 0)
+    file_count = cluster.get("file_count", 0)
+    data_processed = cluster.get("data_processed") or f"{round(total_rows / 1000, 2)}K records"
+
     return {
-        "dataProcessed": f"{round(total_rows / 1000, 2)}K records",
-        "hdfsUsage": disk.percent,
-        "nodes": max(1, file_count),
-        "clusterStatus": "healthy" if hdfs_status == "connected" else "degraded",
-        "processingSpeed": [{"time": f"{hour}:00", "speed": round(cpu + hour, 2)} for hour in range(1, 9)],
+        "dataProcessed": data_processed,
+        "hdfsUsage": hdfs_usage,
+        "nodes": max(1, live_nodes),
+        "fileCount": file_count,
+        "clusterStatus": cluster.get("cluster_status", "unavailable"),
+        "namenodeUrl": cluster.get("namenode_url"),
+        "totalStorage": cluster.get("total_human", "N/A"),
+        "usedStorage": cluster.get("used_human", "N/A"),
+        "hdfsFiles": cluster.get("files", []),
+        "processingSpeed": [{"time": f"{hour}:00", "speed": round(file_count * 2 + hour * 3, 2)} for hour in range(1, 9)],
         "resourceUtilization": [
-            {"name": "CPU", "value": cpu},
-            {"name": "RAM", "value": ram},
-            {"name": "Storage", "value": disk.percent},
+            {"name": "HDFS Used", "value": hdfs_usage},
+            {"name": "DataNodes", "value": min(100, live_nodes * 25)},
+            {"name": "Files Stored", "value": min(100, file_count * 5)},
         ],
         "storageGrowth": storage_growth,
+        "connected": cluster.get("connected", False),
     }
 
 
@@ -628,13 +629,7 @@ async def system_status(_=Depends(require_roles(UserRole.admin, UserRole.analyst
     except Exception:
         redis_ok = False
 
-    hdfs_ok = False
-    try:
-        client = InsecureClient(f"http://{settings.hdfs_host}:{settings.hdfs_port}", user=settings.hdfs_user)
-        client.list(settings.hdfs_base_path)
-        hdfs_ok = True
-    except Exception:
-        hdfs_ok = False
+    hdfs_ok = hdfs_service.is_connected()
 
     healthy = mongo_ok and redis_ok
     return {
@@ -654,9 +649,53 @@ async def system_resources(_=Depends(require_roles(UserRole.admin, UserRole.anal
 
 @system.get("/hdfs")
 async def hdfs_status(_=Depends(require_roles(UserRole.admin, UserRole.analyst))):
+    cluster = hdfs_service.get_cluster_metrics()
+    if not cluster.get("connected"):
+        return {"hadoop_status": "unavailable", "error": cluster.get("error", "HDFS not reachable")}
+    return {
+        "hadoop_status": "connected",
+        "cluster": cluster,
+        "files": cluster.get("files", []),
+        "namenode_ui": f"{cluster.get('namenode_url', '')}/dfshealth.html#tab-overview",
+    }
+
+
+@hdfs_router.get("/cluster")
+async def hdfs_cluster(_=Depends(require_roles(UserRole.admin, UserRole.teacher, UserRole.analyst))):
+    return hdfs_service.get_cluster_metrics()
+
+
+@hdfs_router.get("/files")
+async def hdfs_files(_=Depends(require_roles(UserRole.admin, UserRole.teacher, UserRole.analyst))):
+    if not hdfs_service.is_connected():
+        raise HTTPException(status_code=503, detail="Hadoop HDFS cluster is not running")
+    return {"base_path": settings.hdfs_base_path, "files": hdfs_service.list_files_detailed()}
+
+
+@hdfs_router.get("/download")
+async def hdfs_download(path: str, _=Depends(require_roles(UserRole.admin, UserRole.analyst))):
+    if not path.startswith(settings.hdfs_base_path):
+        raise HTTPException(status_code=400, detail="Invalid HDFS path")
     try:
-        client = InsecureClient(f"http://{settings.hdfs_host}:{settings.hdfs_port}", user=settings.hdfs_user)
-        files = client.list(settings.hdfs_base_path)
-        return {"hadoop_status": "connected", "files": files}
+        content = hdfs_service.read_file(path)
     except Exception as exc:
-        return {"hadoop_status": "unavailable", "error": str(exc)}
+        raise HTTPException(status_code=404, detail=f"File not found: {exc}") from exc
+    filename = path.split("/")[-1]
+    return Response(content=content, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+@hdfs_router.post("/process/{dataset_id}")
+async def hdfs_process_dataset(dataset_id: str, _=Depends(require_roles(UserRole.admin, UserRole.analyst))):
+    from bson import ObjectId
+    row = await get_db().datasets.find_one({"_id": ObjectId(dataset_id)})
+    if not row:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    hdfs_path = row.get("hdfs_path")
+    if not hdfs_path:
+        raise HTTPException(status_code=400, detail="Dataset has no HDFS path")
+    try:
+        stats = hadoop_processor.process_hdfs_file(hdfs_path)
+    except HDFSError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await get_db().datasets.update_one({"_id": ObjectId(dataset_id)}, {"$set": {"batch_stats": stats, "hadoop_processed": True}})
+    return {"message": "Hadoop batch processing complete", "stats": stats}

@@ -3,10 +3,13 @@ import random
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+import pandas as pd
 from faker import Faker
 
 from app.auth.security import hash_password
 from app.database.mongo import close_mongo_connection, connect_to_mongo, get_db
+from app.hadoop.hdfs_service import hdfs_service
+from app.hadoop.processor import hadoop_processor
 from app.ml.models import MLService
 
 fake = Faker()
@@ -36,6 +39,57 @@ async def ensure_demo_users(db):
         )
     print("Demo users ready:", ", ".join(u["email"] for u in DEMO_USERS))
 
+
+async def seed_hdfs(db):
+    """Export MongoDB collections to HDFS — primary data lake for EduPredict."""
+    if not hdfs_service.is_connected():
+        print("WARNING: Hadoop HDFS not running. Start with: docker compose up -d namenode datanode")
+        return
+
+    exports = {
+        "students.csv": [doc async for doc in db.students.find({}, {"_id": 0})],
+        "attendance.csv": [doc async for doc in db.attendance.find({}, {"_id": 0}).limit(5000)],
+        "academic_records.csv": [doc async for doc in db.academic_records.find({}, {"_id": 0})],
+        "courses.csv": [doc async for doc in db.courses.find({}, {"_id": 0})],
+    }
+
+    for filename, rows in exports.items():
+        if not rows:
+            continue
+
+        frame = pd.DataFrame(rows)
+
+        # Convert datetime columns to string before exporting
+        for col in frame.columns:
+            if str(frame[col].dtype).startswith("datetime"):
+                frame[col] = frame[col].astype(str)
+
+        path = hadoop_processor.export_dataframe_to_hdfs(filename, frame)
+        stats = hadoop_processor.process_hdfs_file(path)
+
+        await db.datasets.update_one(
+            {"filename": filename},
+            {
+                "$set": {
+                    "filename": filename,
+                    "hdfs_path": path,
+                    "hdfs_status": "stored",
+                    "rows_after": len(frame),
+                    "rows_before": len(frame),
+                    "columns": list(frame.columns),
+                    "hadoop_processed": True,
+                    "batch_stats": stats,
+                    "source": "academic",
+                    "size": f"{round(len(frame) * 50 / 1024, 1)} KB",
+                    "created_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+
+        print(f"HDFS: uploaded {filename} ({len(frame)} rows) -> {path}")
+
+    print("HDFS seed complete — all datasets stored in", hdfs_service.list_files())
 
 async def seed():
     await connect_to_mongo()
@@ -155,6 +209,7 @@ async def seed():
         print("Dataset already present, skipping bulk seed.")
 
     await ensure_demo_users(db)
+    await seed_hdfs(db)
     await close_mongo_connection()
 
 

@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Database, Upload, Trash2, Eye, X } from 'lucide-react'
+import { Database, Upload, Trash2, Eye, X, Cpu } from 'lucide-react'
 import { toast } from 'sonner'
-import { fetchDatasets, uploadDataset, deleteDataset, getDataset } from '@/services/dataService'
+import { fetchDatasets, uploadDataset, deleteDataset, getDataset, processHdfsDataset } from '@/services/dataService'
 import { PageHeader } from '@/components/shared/PageHeader'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -37,11 +37,20 @@ export function DataSourcesPage() {
     onError: (e: Error) => toast.error(e.message),
   })
 
+  const processMutation = useMutation({
+    mutationFn: processHdfsDataset,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['datasets'] })
+      toast.success('Hadoop batch processing complete')
+    },
+    onError: (e: Error) => toast.error(e.message),
+  })
+
   const deleteMutation = useMutation({
     mutationFn: deleteDataset,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['datasets'] })
-      toast.success('Dataset deleted')
+      toast.success('Dataset deleted from MongoDB and HDFS')
     },
   })
 
@@ -116,9 +125,15 @@ export function DataSourcesPage() {
                   <div><p className="font-bold">{ds.size}</p><p className="text-xs text-muted">Size</p></div>
                   <div><p className="font-bold text-xs">{new Date(ds.lastUpdated).toLocaleDateString()}</p><p className="text-xs text-muted">Updated</p></div>
                 </div>
-                <div className="mt-4 flex gap-2">
+                {'hdfsPath' in ds && ds.hdfsPath && (
+                  <p className="mt-2 truncate font-mono text-xs text-muted">HDFS: {ds.hdfsPath}</p>
+                )}
+                <div className="mt-4 flex flex-wrap gap-2">
                   <Button variant="outline" size="sm" onClick={() => handlePreview(ds.id)} disabled={previewId === ds.id}>
                     <Eye className="h-4 w-4" /> Preview
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => processMutation.mutate(ds.id)} disabled={processMutation.isPending}>
+                    <Cpu className="h-4 w-4" /> Hadoop Process
                   </Button>
                   <Button variant="ghost" size="sm" onClick={() => deleteMutation.mutate(ds.id)}>
                     <Trash2 className="h-4 w-4 text-danger" />

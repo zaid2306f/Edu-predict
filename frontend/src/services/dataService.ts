@@ -28,7 +28,7 @@ function toCourse(raw: Record<string, unknown>): Course {
   }
 }
 
-function toDataset(raw: Record<string, unknown>): Dataset {
+function toDataset(raw: Record<string, unknown>): Dataset & { hdfsPath?: string; hadoopProcessed?: boolean } {
   const source = String(raw.source ?? 'academic') as Dataset['source']
   return {
     id: String(raw._id ?? raw.id ?? ''),
@@ -38,6 +38,8 @@ function toDataset(raw: Record<string, unknown>): Dataset {
     size: String(raw.size ?? 'N/A'),
     lastUpdated: String(raw.created_at ?? new Date().toISOString()),
     status: String(raw.hdfs_status ?? 'active') === 'stored' ? 'active' : 'processing',
+    hdfsPath: typeof raw.hdfs_path === 'string' ? raw.hdfs_path : undefined,
+    hadoopProcessed: Boolean(raw.hadoop_processed),
   }
 }
 
@@ -153,11 +155,32 @@ export async function fetchHadoopMetrics() {
     dataProcessed: string
     hdfsUsage: number
     nodes: number
+    fileCount?: number
     clusterStatus: string
+    connected?: boolean
+    namenodeUrl?: string
+    totalStorage?: string
+    usedStorage?: string
+    hdfsFiles?: Array<{ name: string; path: string; size: string; size_bytes?: number }>
     processingSpeed: Array<{ time: string; speed: number }>
     resourceUtilization: Array<{ name: string; value: number }>
     storageGrowth: Array<{ month: string; tb: number }>
   }
+}
+
+export async function fetchHdfsFiles() {
+  const res = await api.get('/hdfs/files')
+  return res.data as { base_path: string; files: Array<{ name: string; path: string; size: string }> }
+}
+
+export async function fetchHdfsCluster() {
+  const res = await api.get('/hdfs/cluster')
+  return res.data as Record<string, unknown>
+}
+
+export async function processHdfsDataset(datasetId: string) {
+  const res = await api.post(`/hdfs/process/${datasetId}`)
+  return res.data as { message: string; stats: Record<string, unknown> }
 }
 
 export async function fetchPredictions() {

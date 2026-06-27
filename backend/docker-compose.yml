@@ -1,18 +1,105 @@
 services:
-  backend:
-    build: .
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: edupredict-namenode
+    restart: unless-stopped
     ports:
-      - '8000:8000'
+      - "9870:9870"
+      - "9000:9000"
+    environment:
+      - CLUSTER_NAME=edupredict
     env_file:
-      - .env
+      - ./hadoop/hadoop.env
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: edupredict-datanode
+    restart: unless-stopped
+    ports:
+      - "9864:9864"
+      - "9866:9866"
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+    env_file:
+      - ./hadoop/hadoop.env
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
     depends_on:
-      - mongodb
-      - redis
+      namenode:
+        condition: service_healthy
+
+  hdfs-init:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: edupredict-hdfs-init
+    env_file:
+      - ./hadoop/hadoop.env
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_started
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for HDFS NameNode..."
+        for i in $(seq 1 30); do
+          hdfs dfs -ls / >/dev/null 2>&1 && break
+          sleep 5
+        done
+        hdfs dfs -mkdir -p /edupredict
+        hdfs dfs -chmod -R 777 /edupredict
+        echo "HDFS contents:"
+        hdfs dfs -ls /edupredict || hdfs dfs -ls /
+        echo "HDFS /edupredict ready"
+    restart: "no"
+
   mongodb:
     image: mongo:7
+    container_name: edupredict-mongodb
+    restart: unless-stopped
     ports:
-      - '27017:27017'
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
   redis:
     image: redis:7
+    container_name: edupredict-redis
+    restart: unless-stopped
     ports:
-      - '6379:6379'
+      - "6379:6379"
+
+  backend:
+    build: .
+    container_name: edupredict-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017
+      - REDIS_URL=redis://redis:6379/0
+      - HDFS_HOST=namenode
+      - HDFS_PORT=9870
+      - HDFS_USER=root
+    depends_on:
+      mongodb:
+        condition: service_started
+      redis:
+        condition: service_started
+      hdfs-init:
+        condition: service_completed_successfully
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  mongo_data:
