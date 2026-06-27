@@ -95,25 +95,17 @@ cd backend
 docker compose up -d mongodb redis
 ```
 
-### 2. Backend
-
-```bash
-cd backend
-python -m venv .venv
+cd d:\EduPredict\backend
+# 1. Start Hadoop + MongoDB + Redis
+docker compose up -d namenode datanode mongodb redis
+docker compose up hdfs-init
+# 2. Seed DB + push to HDFS
 .venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
 python -m app.utils.seeder
+# 3. Backend
 uvicorn app.main:app --reload
-```
-
-API docs: http://localhost:8000/docs
-
-### 3. Frontend
-
-```bash
-cd frontend
-npm install
+# 4. Frontend (separate terminal)
+cd d:\EduPredict\frontend
 npm run dev
 ```
 
